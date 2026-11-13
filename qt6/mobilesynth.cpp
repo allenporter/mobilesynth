@@ -422,6 +422,16 @@ void MobileSynth::set_buffer_size(int v)
     emit bufferSizeChanged();
 }
 
+void MobileSynth::addAudioSource(AudioSource *source)
+{
+    m_generator->addAudioSource(source);
+}
+
+void MobileSynth::removeAudioSource(AudioSource *source)
+{
+    m_generator->removeAudioSource(source);
+}
+
 void MobileSynth::suspendAudio()
 {
     m_audioOutput->suspend();

@@ -18,7 +18,10 @@
 #include <QTimerEvent>
 #include <QMap>
 
+#include <mutex>
+
 #include <polymobilesynth/mobilesynth/Classes/synth/controller.h>
+#include <polymobilesynth/qt6/audiosource.h>
 
 class Qt68Wraper : public QIODevice
 {
@@ -83,6 +86,8 @@ public:
     void setFormat(const QAudioFormat &format);
     void setBufferSize(int s);
 
+    void addAudioSource(AudioSource *source);
+    void removeAudioSource(AudioSource *source);
 
 signals:
     void sampleUpdated();
@@ -108,7 +113,7 @@ private:
     QVector<synth::Controller *> syctl;
     QVector<int> VoiceMap;
     QVector<float> VoiceFreqMap;
-    QAudioSink *m_audioOutput;
+    QAudioSink *m_audioOutput{nullptr};
     QIODevice *m_output; // not owned
     QAudioFormat m_format;
 
@@ -117,7 +122,17 @@ private:
     int VoiceCount;
     bool arpeggioEnabled;
 
-    qreal GetSampleSum();
+    // additional generators mixed into the output (see audiosource.h)
+    QVector<AudioSource *> audioSources;
+    std::mutex audioSourcesMutex;
+    QVector<float> srcL;
+    QVector<float> srcR;
+    QVector<float> extL;
+    QVector<float> extR;
+    int extFrames{0};
+
+    void RenderAudioSources(int frames);
+    void GetSampleSum(int frame, qreal *x);
 };
 
 #endif // QT68WRAPER_H

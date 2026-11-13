@@ -74,6 +74,62 @@ void Qt68Wraper::setFormat(const QAudioFormat& format) {
     sampleFormat = format.sampleFormat();
     sampleLittleEndian = QSysInfo::ByteOrder == 1 ? true : false;
     qDebug() << "sampleType " <<  sampleFormat << " channelCount " << channelCount << " channelBytes " << channelBytes << " sampleLittleEndian " << sampleLittleEndian;
+
+    std::lock_guard<std::mutex> lock(audioSourcesMutex);
+    for(const auto source:std::as_const(audioSources)) {
+        source->setSampleRate(DataSampleRateHz);
+    }
+}
+
+void Qt68Wraper::addAudioSource(AudioSource *source)
+{
+    source->setSampleRate(DataSampleRateHz);
+
+    std::lock_guard<std::mutex> lock(audioSourcesMutex);
+    if(!audioSources.contains(source)) {
+        audioSources.append(source);
+    }
+}
+
+void Qt68Wraper::removeAudioSource(AudioSource *source)
+{
+    // once this returns the audio thread does not touch the source anymore
+    std::lock_guard<std::mutex> lock(audioSourcesMutex);
+    audioSources.removeAll(source);
+}
+
+void Qt68Wraper::RenderAudioSources(int frames)
+{
+    extFrames = 0;
+
+    // never block the audio thread: skip the sources while they are reconfigured
+    std::unique_lock<std::mutex> lock(audioSourcesMutex, std::try_to_lock);
+    if(!lock.owns_lock() || audioSources.isEmpty() || frames<=0) {
+        return;
+    }
+
+    if(srcL.size()<frames) {
+        srcL.resize(frames);
+        srcR.resize(frames);
+        extL.resize(frames);
+        extR.resize(frames);
+    }
+
+    for(const auto source:std::as_const(audioSources)) {
+        if(!source->render(srcL.data(), srcR.data(), frames)) {
+            continue;
+        }
+        if(extFrames==0) {
+            std::copy_n(srcL.constData(), frames, extL.data());
+            std::copy_n(srcR.constData(), frames, extR.data());
+            extFrames = frames;
+        } else {
+            for(int i=0;i<frames;i++) {
+                extL[i] += srcL.at(i);
+                extR[i] += srcR.at(i);
+            }
+        }
+    }
 }
 
 void Qt68Wraper::setBufferSize(int s)
@@ -93,19 +149,31 @@ void Qt68Wraper::stop()
     close();
 }
 
-qreal Qt68Wraper::GetSampleSum() {
+void Qt68Wraper::GetSampleSum(int frame, qreal *x) {
 
-    // mix the value of all synth voices
-    qreal x=0;
+    // mix the value of all synth voices (mono)
+    qreal v=0;
     for(const auto voice:std::as_const(syctl)) {
-        x+=voice->GetSample();
+        v+=voice->GetSample();
     }
-    x = fmaxf(-1.0f, x);
-    x = fminf(1.0f, x);
+
+    // add the additional audio sources (stereo)
+    qreal l=v;
+    qreal r=v;
+    if(frame<extFrames) {
+        l+=extL.at(frame);
+        r+=extR.at(frame);
+        if(channelCount<2) {
+            l=r=(l+r)/2;
+        }
+    }
+
+    l = fmax(-1.0, fmin(1.0, l));
+    r = fmax(-1.0, fmin(1.0, r));
 
     // calculate peak and clip
-    qreal xAbs = fabs(x);
-    peakValue = fmaxf(peakValue,xAbs);
+    qreal xAbs = fmax(fabs(l),fabs(r));
+    peakValue = fmax(peakValue,xAbs);
     if(xAbs==1) {
         clip=true;
         clipLen++;
@@ -113,7 +181,9 @@ qreal Qt68Wraper::GetSampleSum() {
     } else {
         clipLen=0;
     }
-    return x;
+
+    x[0]=l;
+    x[1]=r;
 }
 
 qint64 Qt68Wraper::readData(char *data, qint64 len)
@@ -125,14 +195,19 @@ qint64 Qt68Wraper::readData(char *data, qint64 len)
     clipLenMax = 0;
 
     if(channelBytes>0) {
+        // x holds the left and right value of the current frame
+        qreal x[2];
+        int frame=0;
+        RenderAudioSources(len / (channelBytes*channelCount));
+
         unsigned char *ptr = reinterpret_cast<unsigned char *>(data);
 
         if (channelBytes == 1 && sampleFormat == 1 /* QAudioFormat::UInt8 */) {
             while (len>0) {
-                qreal x=GetSampleSum();
+                GetSampleSum(frame++, x);
 
                 for(int i=0;i<channelCount;i++) {
-                    const quint8 value = static_cast<quint8>((1.0 + x) / 2 * 255);
+                    const quint8 value = static_cast<quint8>((1.0 + x[i&1]) / 2 * 255);
                     *reinterpret_cast<quint8*>(ptr) = value;
 
                     ptr += channelBytes;
@@ -141,10 +216,10 @@ qint64 Qt68Wraper::readData(char *data, qint64 len)
             }
         } else if (channelBytes == 2 && sampleFormat == 2 && sampleLittleEndian == true  /* QAudioFormat::Int16 */) {
             while (len>0) {
-                qreal x=GetSampleSum();
+                GetSampleSum(frame++, x);
 
                 for(int i=0;i<channelCount;i++) {
-                    qint16 value = static_cast<qint16>(x * 32767);
+                    qint16 value = static_cast<qint16>(x[i&1] * 32767);
                     qToLittleEndian<qint16>(value, ptr);
 
                     ptr += channelBytes;
@@ -153,10 +228,10 @@ qint64 Qt68Wraper::readData(char *data, qint64 len)
             }
         } else if (channelBytes == 2 && sampleFormat == 2 && sampleLittleEndian == false  /* QAudioFormat::Int16 */) {
             while (len>0) {
-                qreal x=GetSampleSum();
+                GetSampleSum(frame++, x);
 
                 for(int i=0;i<channelCount;i++) {
-                    qint16 value = static_cast<qint16>(x * 32767);
+                    qint16 value = static_cast<qint16>(x[i&1] * 32767);
                     qToBigEndian<qint16>(value, ptr);
 
                     ptr += channelBytes;
@@ -165,10 +240,10 @@ qint64 Qt68Wraper::readData(char *data, qint64 len)
             }
         } else if (channelBytes == 4 && sampleFormat == 3 && sampleLittleEndian == true  /* QAudioFormat::Int32 */) {
             while (len>0) {
-                qreal x=GetSampleSum();
+                GetSampleSum(frame++, x);
 
                 for(int i=0;i<channelCount;i++) {
-                    qint32 value = static_cast<qint32>(x * 2147483647);
+                    qint32 value = static_cast<qint32>(x[i&1] * 2147483647);
                     qToLittleEndian<qint32>(value, ptr);
 
                     ptr += channelBytes;
@@ -177,10 +252,10 @@ qint64 Qt68Wraper::readData(char *data, qint64 len)
             }
         } else if (channelBytes == 4 && sampleFormat == 3 && sampleLittleEndian == false  /* QAudioFormat::Int32 */) {
             while (len>0) {
-                qreal x=GetSampleSum();
+                GetSampleSum(frame++, x);
 
                 for(int i=0;i<channelCount;i++) {
-                    qint32 value = static_cast<qint32>(x * 2147483647);
+                    qint32 value = static_cast<qint32>(x[i&1] * 2147483647);
                     qToBigEndian<qint32>(value, ptr);
 
                     ptr += channelBytes;
@@ -189,10 +264,10 @@ qint64 Qt68Wraper::readData(char *data, qint64 len)
             }
         } else if (channelBytes == 4 && sampleFormat == 4 /* QAudioFormat::Float */) {
             while (len>0) {
-                qreal x=GetSampleSum();
+                GetSampleSum(frame++, x);
 
                 for(int i=0;i<channelCount;i++) {
-                    *reinterpret_cast<float*>(ptr) = x;
+                    *reinterpret_cast<float*>(ptr) = x[i&1];
 
                     ptr += channelBytes;
                     len -= channelBytes;

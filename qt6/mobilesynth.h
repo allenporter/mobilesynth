@@ -86,6 +86,10 @@ public:
     Q_INVOKABLE void push_mode();
     Q_INVOKABLE void set_buffer_size(int v);
 
+    //! Mix an additional generator (e.g. a soundfont player) into the output
+    void addAudioSource(AudioSource *source);
+    void removeAudioSource(AudioSource *source);
+
 signals:
     void sampleUpdated();
     void formatUpdated();
